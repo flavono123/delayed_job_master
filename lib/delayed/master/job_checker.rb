@@ -1,4 +1,4 @@
-require_relative 'job_counter'
+require_relative 'job_finder'
 
 module Delayed
   class Master
@@ -6,57 +6,52 @@ module Delayed
       def initialize(master)
         @master = master
         @config = master.config
-        @spec_names = target_spec_names
-
-        define_models
-        extend_after_fork_callback
+        @mlti_db = MultiDB.new(@master)
+        @finder = JobFinder.new(@master)
+        @monitor = Monitor.new
       end
 
       def check
         workers = []
-        mon = Monitor.new
 
-        threads = @spec_names.map do |spec_name|
-          Thread.new(spec_name) do |spec_name|
-            find_jobs_in_db(spec_name) do |setting|
-              mon.synchronize do
-                workers << Worker.new(index: @master.workers.size + workers.size, database: spec_name, setting: setting)
-              end
+        @mlti_db.start_thread do |spec_name|
+          settings = @finder.find(model_for(spec_name))
+          settings.each do |setting|
+            @monitor.synchronize do
+              workers << Worker.new(index: @master.workers.size + workers.size, database: spec_name, setting: setting)
             end
           end
         end
-
-        threads.each(&:join)
 
         workers
       end
 
       private
 
-      def define_models
-        @spec_names.each do |spec_name|
-          klass = Class.new(Delayed::Job)
-          klass_name = "DelayedJob#{spec_name.capitalize}"
-          unless Delayed::Master.const_defined?(klass_name)
-            Delayed::Master.const_set(klass_name, klass)
-            Delayed::Master.const_get(klass_name).establish_connection(spec_name)
-          end
-        end
-      end
-
       def model_for(spec_name)
-        Delayed::Master.const_get("DelayedJob#{spec_name.capitalize}")
+        Delayed::Master.const_get("DelayedJobMaster#{spec_name.capitalize}")
+      end
+    end
+
+    class MultiDB
+      def initialize(master)
+        @config = master.config
+        @spec_names = target_spec_names
+        define_models
+        extend_after_fork_callback
       end
 
-      def extend_after_fork_callback
-        prc = @config.after_fork
-        @config.after_fork do |master, worker|
-          prc.call(master, worker)
-          if worker.database && ActiveRecord::Base.connection_pool.spec.name != worker.database.to_s
-            ActiveRecord::Base.establish_connection(worker.database)
+      def start_thread
+        threads = @spec_names.map do |spec_name|
+          Thread.new(spec_name) do |spec_name|
+            yield spec_name
           end
         end
+
+        threads.each(&:join)
       end
+
+      private
 
       def target_spec_names
         if @config.databases.nil? || @config.databases.empty?
@@ -80,16 +75,23 @@ module Delayed
         ActiveRecord::Base.connection.tables.include?('delayed_jobs')
       end
 
-      def find_jobs_in_db(spec_name)
-        counter = JobCounter.new(model_for(spec_name))
+      def define_models
+        @spec_names.each do |spec_name|
+          klass = Class.new(Delayed::Job)
+          klass_name = "DelayedJobMaster#{spec_name.capitalize}"
+          unless Delayed::Master.const_defined?(klass_name)
+            Delayed::Master.const_set(klass_name, klass)
+            Delayed::Master.const_get(klass_name).establish_connection(spec_name)
+          end
+        end
+      end
 
-        @config.worker_settings.each do |setting|
-          count = @master.workers.count { |worker| worker.setting.queues == setting.queues }
-          slot = setting.count - count
-          if slot > 0 && (job_count = counter.count(setting)) > 0
-            [slot, job_count].min.times do
-              yield setting
-            end
+      def extend_after_fork_callback
+        prc = @config.after_fork
+        @config.after_fork do |master, worker|
+          prc.call(master, worker)
+          if worker.database && ActiveRecord::Base.connection_pool.spec.name != worker.database.to_s
+            ActiveRecord::Base.establish_connection(worker.database)
           end
         end
       end
